@@ -919,6 +919,107 @@ pub async fn get_network_info_data(conn: &Connection) -> zbus::Result<NetworkInf
     })
 }
 
+/// 判断 ofono 返回的值是否是「无效占位符」
+///
+/// ofono 在模组未上报身份信息时（AT+CGMI / AT+CGMM 返回空），
+/// 会填入内置默认字符串 "Fake Modem Manufacturer" / "Fake Modem Model"，
+/// 而不是留空。这类值对用户毫无意义，需要 fallback 到 USB 描述符。
+fn is_placeholder(v: &str) -> bool {
+    let t = v.trim();
+    if t.is_empty() {
+        return true;
+    }
+    let lower = t.to_ascii_lowercase();
+    lower.contains("fake modem")
+        || lower == "unknown"
+        || lower == "null"
+        || lower.starts_with("fake")
+}
+
+/// 从 USB gadget 描述符读取真实的制造商 / 产品名
+///
+/// 展锐模组通过 USB gadget 机制枚举，真正的身份写在这里：
+///   - manufacturer -> "SOYEA"
+///   - product      -> "unisoc-5g-modem-<id>00<sn>"
+/// 遍历 /sys/class/udc 下的 gadget 描述符目录读取。
+fn read_usb_identity() -> (Option<String>, Option<String>) {
+    use std::fs;
+
+    let mut manufacturer = None;
+    let mut product = None;
+
+    // USB gadget 字符串描述符通常挂在 configfs 下
+    let search_roots = [
+        "/sys/kernel/config/usb_gadget",
+        "/sys/class/udc",
+    ];
+
+    for root in search_roots.iter() {
+        let entries = match fs::read_dir(root) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let strings = entry.path().join("strings/0x409");
+            if let Ok(s) = fs::read_to_string(strings.join("manufacturer")) {
+                let s = s.trim().to_string();
+                if !s.is_empty() && manufacturer.is_none() {
+                    manufacturer = Some(s);
+                }
+            }
+            if let Ok(s) = fs::read_to_string(strings.join("product")) {
+                let s = s.trim().to_string();
+                if !s.is_empty() && product.is_none() {
+                    product = Some(s);
+                }
+            }
+        }
+        if manufacturer.is_some() || product.is_some() {
+            break;
+        }
+    }
+
+    // 退化方案: 读本机 USB 设备描述符 (/sys/bus/usb/devices/*/product)
+    if manufacturer.is_none() || product.is_none() {
+        if let Ok(entries) = fs::read_dir("/sys/bus/usb/devices") {
+            for entry in entries.flatten() {
+                let p = entry.path();
+
+                if manufacturer.is_none() {
+                    if let Ok(s) = fs::read_to_string(p.join("manufacturer")) {
+                        let s = s.trim().to_string();
+                        if !s.is_empty() && !is_placeholder(&s) {
+                            manufacturer = Some(s);
+                        }
+                    }
+                }
+                if product.is_none() {
+                    if let Ok(s) = fs::read_to_string(p.join("product")) {
+                        let s = s.trim().to_string();
+                        if !s.is_empty() && !is_placeholder(&s) {
+                            product = Some(s);
+                        }
+                    }
+                }
+
+                if manufacturer.is_some() && product.is_some() {
+                    break;
+                }
+            }
+        }
+    }
+
+    // 最终兜底: 已知该平台硬件身份
+    if manufacturer.is_none() {
+        manufacturer = Some("SOYEA".to_string());
+    }
+    if product.is_none() {
+        product = Some("UDX710 (UNISOC 5G modem)".to_string());
+    }
+
+    (manufacturer, product)
+}
+
 /// 获取设备信息（来自 D-Bus Modem 接口）
 ///
 /// # Arguments
@@ -935,15 +1036,31 @@ pub async fn get_device_info_data(conn: &Connection) -> zbus::Result<DeviceInfoR
         .and_then(|v| String::try_from(v.clone()).ok())
         .unwrap_or_default();
 
-    let manufacturer = props
+    let mut manufacturer = props
         .get("Manufacturer")
         .and_then(|v| String::try_from(v.clone()).ok())
         .unwrap_or_default();
 
-    let model = props
+    let mut model = props
         .get("Model")
         .and_then(|v| String::try_from(v.clone()).ok())
         .unwrap_or_default();
+
+    // ofono 对未上报身份的模组会返回 "Fake Modem *" 占位符,
+    // 此时改用 USB 描述符里的真实身份。
+    if is_placeholder(&manufacturer) || is_placeholder(&model) {
+        let (usb_mfr, usb_model) = read_usb_identity();
+        if is_placeholder(&manufacturer) {
+            if let Some(m) = usb_mfr {
+                manufacturer = m;
+            }
+        }
+        if is_placeholder(&model) {
+            if let Some(m) = usb_model {
+                model = m;
+            }
+        }
+    }
 
     let revision = props
         .get("Revision")
